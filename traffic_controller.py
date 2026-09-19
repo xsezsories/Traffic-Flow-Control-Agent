@@ -129,6 +129,15 @@ class TrafficController:
         self.timer = 0.0
         self._apply_state()
 
+    def get_active_green_group(self):
+        """ คืน "NS" / "EW" ถ้าฝั่งนั้นกำลังไฟเขียวอยู่ตอนนี้ หรือ None ถ้าอยู่ช่วงเหลือง/all-red
+            ใช้บอก LaneMonitor ว่ารถที่หยุดนิ่งอยู่ในเลนไหน 'ควรขยับได้แล้วแต่ไม่ขยับ' จริงๆ """
+        if self.state == GREEN_NS:
+            return "NS"
+        elif self.state == GREEN_EW:
+            return "EW"
+        return None
+
     # ---------- เรียกทุก tick ----------
     def update(self, dt, lanes_status, emergency_info, incident_info):
         self.timer += dt

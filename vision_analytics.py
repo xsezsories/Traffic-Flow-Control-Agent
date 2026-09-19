@@ -20,6 +20,8 @@ import time
 AVG_VEHICLE_LENGTH_M = 4.5      # ค่าประมาณความยาวรถเฉลี่ย ใช้คำนวณ occupancy_ratio
 STATIONARY_SPEED_THRESHOLD = 0.3  # m/s ต่ำกว่านี้ถือว่า "หยุดนิ่ง"
 INCIDENT_STOPPED_SEC = 20.0     # ตาม TC-04: หยุดนิ่ง >20s ในเลน active ถือเป็น incident
+BOX_BUFFER_M = 8.0               # ระยะเผื่อครอบคลุมเข้าไปในกล่องกลางแยก (กันรถที่ขยับ
+                                  # ล้ำเส้นหยุดไปแล้ว หรือรถ "block the box" หลุดจากการนับ)
 
 EMERGENCY_VEHICLE_TYPES = {
     'vehicle.carlamotors.firetruck',
@@ -62,6 +64,7 @@ def build_lane_zones(world, junction, zone_length=30.0, debug_draw=True):
 
         zones[lane_key] = {
             'entry_location': entry_point.transform.location,
+            'entry_waypoint': entry_point,
             'forward': fwd,
             'lane_width': entry_point.lane_width,
             'zone_length': zone_length,
@@ -105,12 +108,17 @@ class LaneMonitor:
             rel_y = loc.y - entry_loc.y
             along = -(rel_x * fwd.x + rel_y * fwd.y)   # ระยะถอยหลังจากจุดเข้าแยก ตามแนวเลน
             lateral = abs(rel_x * (-fwd.y) + rel_y * fwd.x)  # ระยะเบี่ยงด้านข้างจากกึ่งกลางเลน
-            if 0.0 <= along <= length and lateral <= half_width:
+            # ครอบตั้งแต่ -BOX_BUFFER_M (ล้ำเข้าไปในกล่องกลางแยกได้เล็กน้อย) ถึง zone_length
+            if -BOX_BUFFER_M <= along <= length and lateral <= half_width:
                 found.append(v)
         return found
 
-    def update(self):
-        """ คืน (lanes_status_list, emergency_info, incident_info) """
+    def update(self, active_green_group=None):
+        """ คืน (lanes_status_list, emergency_info, incident_info)
+            active_green_group: "NS" หรือ "EW" ที่ไฟกำลังเขียวอยู่ตอนนี้ (จาก TrafficController)
+            ใช้เช็คว่ารถที่หยุดนิ่ง >20s อยู่ในเลนที่ 'ควรจะขยับได้แล้ว' (ไฟเขียว) จริงไหม
+            ถ้าไม่ส่งมาหรือเป็น None (เช่นตอนไฟเหลือง/all-red) จะไม่นับเป็น incident เลย
+            เพราะรถที่จอดรอไฟแดงตามปกติไม่ใช่อุบัติเหตุ ถึงจะรอนานเกิน 20 วิก็ตาม """
         now = time.time()
         lanes_status = []
         emergency_info = {"emergency_detected": False, "lane_id": None}
@@ -121,6 +129,12 @@ class LaneMonitor:
         for lane_id, zone in self.zones.items():
             vehicles = self._vehicles_in_zone(zone)
             speeds_kmh = []
+
+            lane_is_active_green = (
+                active_green_group == "NS" and lane_id.startswith(("NORTH_INBOUND", "SOUTH_INBOUND"))
+            ) or (
+                active_green_group == "EW" and lane_id.startswith(("EAST_INBOUND", "WEST_INBOUND"))
+            )
 
             for v in vehicles:
                 active_vehicle_ids_this_tick.add(v.id)
@@ -134,10 +148,12 @@ class LaneMonitor:
                     emergency_info = {"emergency_detected": True, "lane_id": lane_id}
 
                 # ---- TC-04: incident / obstruction detection ----
+                # นับเป็น incident เฉพาะรถที่หยุดนิ่ง >20s "ในเลนที่ไฟเขียวอยู่" เท่านั้น
+                # (รถจอดรอไฟแดงตามปกติไม่ใช่อุบัติเหตุ ไม่ว่าจะรอนานแค่ไหน)
                 if speed_ms < STATIONARY_SPEED_THRESHOLD:
                     started = self._stopped_since.setdefault(v.id, now)
                     stopped_duration = now - started
-                    if stopped_duration > INCIDENT_STOPPED_SEC:
+                    if lane_is_active_green and stopped_duration > INCIDENT_STOPPED_SEC:
                         incident_info = {
                             "status": True,
                             "lane_id": lane_id,
@@ -147,7 +163,8 @@ class LaneMonitor:
                     self._stopped_since.pop(v.id, None)
 
             vehicle_count = len(vehicles)
-            occupancy_ratio = min(1.0, (vehicle_count * AVG_VEHICLE_LENGTH_M) / zone['zone_length'])
+            effective_length = zone['zone_length'] + BOX_BUFFER_M
+            occupancy_ratio = min(1.0, (vehicle_count * AVG_VEHICLE_LENGTH_M) / effective_length)
             avg_speed = round(sum(speeds_kmh) / len(speeds_kmh), 1) if speeds_kmh else 0.0
 
             lanes_status.append({
@@ -164,10 +181,11 @@ class LaneMonitor:
 
         return lanes_status, emergency_info, incident_info
 
-    def build_mqtt_payload(self, weather_id="CLEAR_NOON", visibility_score=0.98):
-        """ ประกอบ payload ตาม schema ที่กำหนดไว้ใน spec — ยังไม่ส่ง MQTT จริง
-            (ส่วนต่อ AWS IoT Core / ESP32 ทำทีหลังวันที่ 18-19 ก.ย.) """
-        lanes_status, emergency_info, incident_info = self.update()
+    def build_mqtt_payload(self, lanes_status, emergency_info, incident_info,
+                            weather_id="CLEAR_NOON", visibility_score=0.98):
+        """ ประกอบ payload ตาม schema ที่กำหนดไว้ใน spec จากผลที่ update() คำนวณไว้แล้ว
+            (ไม่เรียก update() ซ้ำเพื่อไม่ให้เสียเวลาคำนวณซ้ำโดยไม่จำเป็นต่อ tick)
+            ยังไม่ส่ง MQTT จริง (ส่วนต่อ AWS IoT Core / ESP32 ทำทีหลังวันที่ 18-19 ก.ย.) """
         payload = {
             "timestamp": int(time.time()),
             "intersection_id": self.intersection_id,
